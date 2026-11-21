@@ -1,3 +1,4 @@
+
 import random
 import time
 import eval7
@@ -203,84 +204,36 @@ def analyze_board(community):
             'caller_favored': caller_fav, 'highest_rank': sr[-1]}
 
 
-
 # =====================================================================
-# HAND RANGES (Chen score ordering of all 1326 starting combos)
-# Used to guess "what cards could the opponent have" from how they played.
+# EQUITY (Monte Carlo, time-capped so we never hit the 2 s limit)
 # =====================================================================
-_SUITS = "cdhs"
-
-
-def _chen(r1, r2, suited):
-    hi, lo = max(r1, r2), min(r1, r2)
-    pts = {12: 10, 11: 8, 10: 7, 9: 6}.get(hi, (hi + 2) / 2.0)
-    if r1 == r2:
-        return max(5, pts * 2)
-    if suited:
-        pts += 2
-    gap = hi - lo - 1
-    pts -= {0: 0, 1: 1, 2: 2, 3: 4}.get(gap, 5)
-    if gap <= 1 and hi < 10:
-        pts += 1
-    return pts
-
-
-ALL_COMBOS = []          # (score, eval7card1, eval7card2), best first
-for _i, _r1 in enumerate(RANK_ORDER):
-    for _j, _r2 in enumerate(RANK_ORDER):
-        if _j < _i:
-            continue
-        for _a, _s1 in enumerate(_SUITS):
-            for _b, _s2 in enumerate(_SUITS):
-                if _i == _j and _b <= _a:
-                    continue
-                _c1 = eval7.Card(_r1 + _s1)
-                _c2 = eval7.Card(_r2 + _s2)
-                ALL_COMBOS.append((_chen(_i, _j, _s1 == _s2) + random.random() * 0.01, _c1, _c2))
-ALL_COMBOS.sort(key=lambda x: -x[0])
-
-
-def range_combos(frac, dead):
-    """Top `frac` of all hands, minus any combo using a card we can see."""
-    n = max(30, int(len(ALL_COMBOS) * min(1.0, max(0.05, frac))))
-    out = []
-    for _, c1, c2 in ALL_COMBOS[:n]:
-        if c1 in dead or c2 in dead:
-            continue
-        out.append((c1, c2))
-    return out
-
-
-# =====================================================================
-# EQUITY vs a RANGE (Monte Carlo, time-capped so we never hit the 2 s limit)
-# =====================================================================
-def calc_equity(my_cards, community, n_sim=2500, opp_frac=1.0, max_seconds=0.7):
+def calc_equity(my_cards, community, n_sim=1500, opp_vpip=None, max_seconds=0.6):
     my_hand = [card_str_to_eval7(c) for c in my_cards]
     board = [card_str_to_eval7(c) for c in community]
-    dead = set(my_hand + board)
-    deck = [c for c in eval7.Deck().cards if c not in dead]
-    combos = range_combos(opp_frac, dead) if opp_frac < 0.999 else None
+    known = set(my_hand + board)
+    remaining = [c for c in eval7.Deck().cards if c not in known]
+    max_tier = 6
+    if opp_vpip is not None and opp_vpip < 0.65:
+        if opp_vpip < 0.25:
+            max_tier = 2
+        elif opp_vpip < 0.35:
+            max_tier = 3
+        elif opp_vpip < 0.48:
+            max_tier = 4
+        elif opp_vpip < 0.60:
+            max_tier = 5
+    wins = ties = total = attempts = 0
     need = 5 - len(board)
-    wins = ties = total = 0
     t0 = time.time()
-    while total < n_sim:
-        if (total & 63) == 0 and total and time.time() - t0 > max_seconds:
+    while total < n_sim and attempts < n_sim * 4:
+        attempts += 1
+        if (attempts & 31) == 0 and time.time() - t0 > max_seconds:
             break
-        if combos:
-            o1, o2 = random.choice(combos)
-            if need:
-                rest = random.sample(deck, need + 2)
-                rest = [c for c in rest if c != o1 and c != o2][:need]
-                if len(rest) < need:
-                    continue
-                full = board + rest
-            else:
-                full = board
-            opp = [o1, o2]
-        else:
-            draw = random.sample(deck, 2 + need)
-            opp = draw[:2]
-            full = board + draw[2:]
+        draw = random.sample(remaining, 2 + need)
+        opp = draw[:2]
+        if max_tier < 6 and get_tier([str(opp[0]), str(opp[1])]) > max_tier:
+            continue
+        full = board + draw[2:]
         ms = eval7.evaluate(my_hand + full)
         os_ = eval7.evaluate(opp + full)
         if ms > os_:
@@ -294,33 +247,26 @@ def calc_equity(my_cards, community, n_sim=2500, opp_frac=1.0, max_seconds=0.7):
 
 
 def shade_equity(eq, owed, pot, stack, om):
-    """Their bet THIS street says their hand got stronger: shade equity down a bit."""
+    """Opponent's betting range is stronger than random: shade equity down."""
     if owed <= 0:
         return eq
     pot_before = max(pot - owed, 1)
     frac = owed / pot_before
     f = 1.0
     if frac > 0.75:
-        f *= 0.92
+        f *= 0.88
     elif frac > 0.30:
-        f *= 0.96
-    if owed >= 0.4 * stack:
         f *= 0.94
+    if owed >= 0.4 * stack:
+        f *= 0.92
     if om.hands_seen >= 10 and om.is_aggressive:
         f = 1 - (1 - f) * 0.4      # maniacs bet wide: trust equity more
-    if om.hands_seen >= 10 and om.is_passive_postflop:
-        f *= 0.92                  # passive players only bet when strong
     return eq * f
 
 
 # =====================================================================
-# OPPONENT MODEL  (stats are blended with a sensible "prior" so the bot
-# acts reasonably from hand 1 and smoothly learns as data comes in)
+# OPPONENT MODEL
 # =====================================================================
-def _blend(hits, n, prior, weight):
-    return (hits + prior * weight) / (n + weight)
-
-
 class OpponentModel:
     def __init__(self):
         self.reset()
@@ -329,8 +275,6 @@ class OpponentModel:
         self.hands_seen = 0
         self.vpip_count = 0
         self.pfr_count = 0
-        self.threebet_count = 0
-        self.threebet_opps = 0
         self.bets = 0
         self.calls = 0
         self.checks = 0
@@ -338,10 +282,10 @@ class OpponentModel:
         self.fold_to_bet = {'preflop': [0, 0], 'flop': [0, 0], 'turn': [0, 0], 'river': [0, 0]}
         self.cr_count = 0
         self.cr_opps = 0
-        self.showdowns = 0
         self.last_hand = -1
 
     def update(self, log, my_seat, current_hand):
+        """Process every COMPLETED hand in the log that we haven't seen yet."""
         by_hand = {}
         for e in log:
             hn = e.get('hand_num')
@@ -353,38 +297,35 @@ class OpponentModel:
             self.last_hand = hn
 
     def _process(self, entries, my_seat):
-        opp_vpip = opp_pfr = False
+        opp_vpip = False
+        opp_pfr = False
         street = None
-        facing = opp_checked = cr_pending = False
-        we_opened_pf = False
+        facing = False
+        opp_checked = False
+        cr_pending = False
         for e in entries:
             act = e.get('action', '')
             seat = e.get('seat', -1)
             st = e.get('street', 'preflop')
-            if act == 'show':
-                self.showdowns += 1
             if act in ('small_blind', 'big_blind', 'ante', 'show', 'win', 'muck'):
                 continue
             if st != street:
                 street = st
-                facing = opp_checked = cr_pending = False
+                facing = False
+                opp_checked = False
+                cr_pending = False
             if seat == my_seat:
                 if act in ('raise', 'all_in'):
                     facing = True
-                    if st == 'preflop':
-                        we_opened_pf = True
                     if opp_checked and st != 'preflop':
                         cr_pending = True
                 continue
+            # ---- opponent action ----
             if st == 'preflop':
                 if act in ('call', 'raise', 'all_in'):
                     opp_vpip = True
                 if act in ('raise', 'all_in'):
                     opp_pfr = True
-                if we_opened_pf and facing:
-                    self.threebet_opps += 1
-                    if act in ('raise', 'all_in'):
-                        self.threebet_count += 1
             else:
                 if act == 'check':
                     self.checks += 1
@@ -416,36 +357,31 @@ class OpponentModel:
 
     @property
     def vpip(self):
-        return _blend(self.vpip_count, self.hands_seen, 0.55, 6)
+        return 0.5 if self.hands_seen < 3 else self.vpip_count / self.hands_seen
 
     @property
     def pfr(self):
-        return _blend(self.pfr_count, self.hands_seen, 0.35, 6)
-
-    @property
-    def threebet(self):
-        return _blend(self.threebet_count, self.threebet_opps, 0.12, 5)
+        return 0.3 if self.hands_seen < 3 else self.pfr_count / self.hands_seen
 
     @property
     def aggression_factor(self):
-        return (self.bets + 2.0) / (self.calls + 2.0)
+        if self.calls == 0:
+            return 2.0 if self.bets > 0 else 1.0
+        return self.bets / self.calls
 
     def get_fold_to_bet(self, street='flop'):
         f, o = self.fold_to_bet.get(street, [0, 0])
-        prior = {'preflop': 0.45, 'flop': 0.42, 'turn': 0.38, 'river': 0.35}.get(street, 0.4)
-        return _blend(f, o, prior, 5)
+        return 0.30 if o < 3 else f / o
 
     @property
     def check_raise_freq(self):
-        return _blend(self.cr_count, self.cr_opps, 0.08, 6)
+        if self.cr_opps < 5:
+            return 0.08
+        return self.cr_count / self.cr_opps
 
     @property
     def is_passive(self):
         return self.vpip > 0.6 and self.aggression_factor < 1.0
-
-    @property
-    def is_passive_postflop(self):
-        return (self.bets + self.calls) >= 10 and self.aggression_factor < 0.6
 
     @property
     def is_tight(self):
@@ -453,20 +389,15 @@ class OpponentModel:
 
     @property
     def is_aggressive(self):
-        return (self.bets + self.calls) >= 6 and self.aggression_factor > 2.0
+        return self.aggression_factor > 2.0
 
     @property
     def is_calling_station(self):
-        return self.hands_seen >= 8 and self.vpip > 0.55 and \
-            self.get_fold_to_bet('flop') < 0.25 and self.aggression_factor < 1.2
-
-    @property
-    def is_overfolder(self):
-        return self.hands_seen >= 8 and self.get_fold_to_bet('flop') > 0.55
+        return self.hands_seen >= 8 and self.vpip > 0.55 and self.aggression_factor < 0.8
 
     @property
     def is_check_raise_heavy(self):
-        return self.cr_opps >= 8 and self.check_raise_freq > 0.15
+        return self.cr_opps >= 10 and self.check_raise_freq > 0.15
 
 
 # =====================================================================
@@ -484,26 +415,21 @@ def _act(action_dict, reason=""):
 # =====================================================================
 # PREFLOP
 # =====================================================================
-BLUFF_3BET = {'A5s', 'A4s', 'A3s', 'A2s', 'K9s', 'Q9s', 'J9s', 'T9s', '98s', '87s', '76s', '65s'}
-
-
-def preflop_decision(tier, canon, is_dealer, seven_two, pot, owed, can_check, can_raise,
+def preflop_decision(tier, is_dealer, seven_two, pot, owed, can_check, can_raise,
                      min_r, max_r, stack, bb, action_log, om, cur_bet):
     n_raises = sum(1 for e in action_log
                    if e.get('street') == 'preflop' and e.get('action') in ('raise', 'all_in'))
     facing_raise = owed > 0 and n_raises >= 1
     facing_3bet = owed > 0 and n_raises >= 2
     need = owed / (pot + owed) if owed > 0 else 0.0
-    big = owed >= 0.5 * stack
+    big = owed >= 0.5 * stack          # facing a bet that commits half our stack
     call_or_check = {"action": "call"} if owed > 0 else {"action": "check"}
     fold_or_check = {"action": "fold"} if owed > 0 else {"action": "check"}
 
     def raise_to(x, reason):
-        if not can_raise:
-            return _act(call_or_check, reason + " (can't raise)")
         return _act({"action": "raise", "amount": size_bet(int(x), min_r, max_r)}, reason)
 
-    # ---- 7-2: raise always (bounty), give up to resistance ----
+    # ---- 7-2: raise always, give up to resistance ----
     if seven_two:
         if not facing_raise and can_raise:
             return raise_to(3 * bb, "7-2 raise")
@@ -511,71 +437,62 @@ def preflop_decision(tier, canon, is_dealer, seven_two, pot, owed, can_check, ca
             return _act(fold_or_check, "7-2 fold to raise")
         return _act(call_or_check, "7-2")
 
-    # ---- Button / small blind first in: raise, never limp ----
+    # ---- Button / small blind opening ----
     if is_dealer and not facing_raise:
         if tier <= 2:
             x = 3.0 * bb
-        elif tier <= 5:
+        elif tier <= 4:
             x = 2.5 * bb
+        elif tier == 5:
+            x = 2.3 * bb
         else:
-            steal = 0.45
-            if om.get_fold_to_bet('preflop') > 0.55 or om.is_tight:
-                steal = 0.80
-            elif om.vpip > 0.80:
-                steal = 0.15      # they never fold: stop stealing trash
+            steal = 0.5 if (om.get_fold_to_bet('preflop') > 0.5 or om.is_tight) else 0.25
             if random.random() < steal:
                 x = 2.2 * bb
             else:
                 return _act(fold_or_check, "trash fold")
-        return raise_to(x, f"open tier {tier}")
+        if can_raise:
+            return raise_to(x, f"open tier {tier}")
+        return _act(call_or_check, "open (can't raise)")
 
     # ---- Facing a 3-bet or bigger ----
     if facing_3bet:
-        loose = om.threebet > 0.25 or om.is_aggressive
         if big:
-            if tier <= 1 or (tier <= 2 and loose):
+            if tier <= 1 or (tier <= 2 and om.is_aggressive):
                 return _act({"action": "call"}, "call big 3bet")
             return _act({"action": "fold"}, "fold to big 3bet")
         if tier <= 1:
-            if random.random() < 0.6 and can_raise:
+            if random.random() < 0.5 and can_raise:
                 return raise_to(cur_bet * 2.3, "4-bet premium")
             return _act({"action": "call"}, "call 3bet premium")
         if tier == 2:
             return _act({"action": "call"}, "call 3bet strong")
-        if tier == 3 and (need < 0.33 or loose):
-            return _act({"action": "call"}, "call 3bet")
-        if tier == 4 and loose and need < 0.30:
-            return _act({"action": "call"}, "call loose 3bettor")
+        if tier == 3 and need < 0.30:
+            return _act({"action": "call"}, "call small 3bet")
         return _act({"action": "fold"}, "fold to 3bet")
 
-    # ---- Facing a single raise (we are BB) ----
+    # ---- Facing a single raise ----
     if facing_raise:
-        loose_opener = om.pfr > 0.60
         if big:
-            if tier <= 1 or (tier <= 2 and (om.is_aggressive or loose_opener)):
+            if tier <= 1 or (tier <= 2 and om.is_aggressive):
                 return _act({"action": "call"}, "call big raise")
             return _act({"action": "fold"}, "fold to big raise")
-        if tier <= 1:
-            return raise_to(cur_bet * 3.0, "3-bet value")
-        if tier == 2 and random.random() < (0.55 if loose_opener else 0.35):
+        if tier <= 1 and can_raise:
+            return raise_to(cur_bet * 3.0, "3-bet premium")
+        if tier == 2 and can_raise and random.random() < 0.35:
             return raise_to(cur_bet * 3.0, "3-bet strong")
-        if canon in BLUFF_3BET and random.random() < (0.30 if om.get_fold_to_bet('preflop') > 0.4 else 0.12):
-            return raise_to(cur_bet * 3.0, "3-bet bluff (blockers/playable)")
-        margin = 0.04 if loose_opener else 0.07
-        if TIER_EQ.get(tier, 0.4) - margin > need:
-            return _act({"action": "call"}, f"defend BB tier {tier}")
+        if TIER_EQ.get(tier, 0.4) - 0.08 > need:
+            return _act({"action": "call"}, f"call raise tier {tier}")
         return _act({"action": "fold"}, "fold to raise")
 
-    # ---- Big blind after a limp ----
+    # ---- Big blind, no raise in front ----
     if not is_dealer:
         if can_raise:
             if tier <= 2:
-                return raise_to(3.5 * bb, "punish limp (value)")
-            if tier <= 4 and random.random() < 0.55:
-                return raise_to(3.0 * bb, "punish limp (mix)")
-            if om.get_fold_to_bet('preflop') > 0.5 and random.random() < 0.35:
-                return raise_to(3.0 * bb, "punish limp (folder)")
-        return _act(call_or_check, "BB check")
+                return raise_to(3.5 * bb, "BB raise strong")
+            if tier <= 4 and random.random() < 0.5:
+                return raise_to(3.0 * bb, "BB raise mix")
+        return _act(call_or_check, "BB check/call")
 
     return _act({"action": "check"} if can_check else {"action": "fold"}, "default")
 
@@ -584,16 +501,15 @@ def preflop_decision(tier, canon, is_dealer, seven_two, pot, owed, can_check, ca
 # PUSH / FOLD (effective stack <= 12 BB)
 # =====================================================================
 def push_fold_decision(tier, is_dealer, stack_bb, stack, can_raise, can_check,
-                       owed, s2, my_cards, om, shove):
+                       owed, s2, my_cards, om):
     canon = canonicalize(my_cards)
+    shove = {"action": "all_in"}
     call_or_check = {"action": "call"} if owed > 0 else {"action": "check"}
     fold_or_check = {"action": "fold"} if owed > 0 else {"action": "check"}
     facing_jam = owed > 0 and owed >= stack * 0.4
 
     if is_dealer and not facing_jam:
         t = PUSH_JAM.get(canon, 0)
-        if om.get_fold_to_bet('preflop') > 0.6:
-            t = max(t, 12) if tier <= 5 else t
         if s2 and can_raise:
             return _act(shove, "7-2 jam")
         if stack_bb <= 2:
@@ -649,117 +565,76 @@ def _can_raise(c):
     return c['cr'] and c['mx'] > 0
 
 
-def _bet(c, frac, reason):
-    return _act({"action": "raise", "amount": _open_bet(c, frac)}, reason)
-
-
-def _value_size(c):
-    """Bigger bets vs players who call too much, smaller vs folders."""
-    om = c['om']
-    base = _pick_size(c)
-    if om.is_calling_station:
-        return min(1.0, base + 0.30)
-    if c['street'] == 'river':
-        base = max(base, 0.60)
-    if om.is_overfolder:
-        return max(0.33, base - 0.10)
-    return base
-
-
 def _play_monster(c):
     om = c['om']
     if c['owed'] > 0:
         if _can_raise(c):
             return _act({"action": "raise", "amount": _raise_over(c, 1.0)}, "monster reraise")
         return _act({"action": "call"}, "monster call")
-    # trap vs aggressive players (let them bet for us), rarely otherwise
-    sf = 0.08 if c['bi'].get('wet') else 0.20
-    if om.is_aggressive and not c['is_dealer']:
-        sf = 0.45
-    if om.is_calling_station:
-        sf = 0.0
-    if c['street'] != 'river' and c['spr'] > 2 and random.random() < sf:
-        return _act({"action": "check"}, "monster trap")
+    sf = 0.08 if c['bi'].get('wet') else 0.22
+    if c['street'] == 'flop' and c['spr'] > 3 and random.random() < sf:
+        return _act({"action": "check"}, "monster slowplay")
     if _can_raise(c):
-        frac = _value_size(c)
         if c['street'] == 'river':
-            frac = max(frac, 0.80)
-        return _bet(c, frac, "monster value bet")
+            frac = 0.80 if om.is_calling_station else SIZE_BIG
+        else:
+            frac = _pick_size(c)
+        return _act({"action": "raise", "amount": _open_bet(c, frac)}, "monster value bet")
     return _act({"action": "check"}, "monster check")
 
 
 def _play_strong(c):
     if c['owed'] > 0:
-        if c['eq'] > 0.78 and _can_raise(c) and random.random() < 0.40:
+        if c['eq'] > 0.78 and _can_raise(c) and random.random() < 0.35:
             return _act({"action": "raise", "amount": _raise_over(c, SIZE_BIG)}, "strong raise")
         return _act({"action": "call"}, "strong call")
-    if c['om'].is_aggressive and not c['is_dealer'] and random.random() < 0.30:
-        return _act({"action": "check"}, "strong check-to-induce")
     if _can_raise(c):
-        return _bet(c, _value_size(c), "strong value bet")
+        return _act({"action": "raise", "amount": _open_bet(c, _pick_size(c))}, "strong value bet")
     return _act({"action": "check"}, "strong check")
 
 
 def _play_good(c):
-    eq, po, draw, om, bi, st = c['eq'], c['po'], c['draw'], c['om'], c['bi'], c['street']
+    eq, po, draw, om = c['eq'], c['po'], c['draw'], c['om']
+    bi = c['bi']
     if c['owed'] > 0:
-        if eq > po + 0.04:
+        if eq > po + 0.05:
             return _act({"action": "call"}, "good call")
         if draw in ('combo', 'flush', 'oesd') and eq > po - 0.08:
             return _act({"action": "call"}, "good + draw call")
         return _act({"action": "fold"}, "good fold")
-    if not _can_raise(c):
-        return _act({"action": "check"}, "good check")
-    # thin value vs people who call too much
-    if om.is_calling_station:
-        return _bet(c, _value_size(c), "thin value vs station")
     if om.is_check_raise_heavy and eq < 0.75:
         return _act({"action": "check"}, "check vs check-raiser")
-    if bi.get('caller_favored') and not draw and not c['initiative']:
+    if bi.get('caller_favored') and not draw:
         return _act({"action": "check"}, "caller's board, pot control")
-    if c['initiative'] or c['is_dealer'] or eq > 0.62:
-        if st == 'river' and eq < 0.62:
-            return _act({"action": "check"}, "river showdown value")
-        return _bet(c, _pick_size(c), "good value/protection bet")
+    if bi.get('wet') and not c['is_dealer'] and not we_raised_preflop:
+        return _act({"action": "check"}, "wet OOP, no aggression")
+    if not we_raised_preflop and eq < 0.65:
+        return _act({"action": "check"}, "no c-bet rights")
+    if _can_raise(c) and (c['street'] != 'river' or eq > 0.63):
+        frac = SIZE_BIG if om.is_calling_station else _pick_size(c)
+        return _act({"action": "raise", "amount": _open_bet(c, frac)}, "good value bet")
     return _act({"action": "check"}, "good check")
 
 
-def _bluff_ok(c, frac):
-    """Bluff only if they fold more often than the break-even rate."""
-    om = c['om']
-    if om.is_calling_station:
-        return False
-    fr = om.get_fold_to_bet(c['street'])
-    be = frac / (1 + frac)            # break-even fold frequency
-    return fr > be - 0.02
-
-
 def _play_marginal(c):
-    eq, po, draw, st, om = c['eq'], c['po'], c['draw'], c['street'], c['om']
+    eq, po, draw = c['eq'], c['po'], c['draw']
     sd = draw in ('combo', 'flush', 'oesd')
+    st = c['street']
     if c['owed'] > 0:
         if eq > po + 0.03:
             return _act({"action": "call"}, "marginal call")
         if sd and st != 'river' and eq > po - 0.10:
             return _act({"action": "call"}, "draw call")
-        if draw == 'combo' and st == 'flop' and _can_raise(c) and random.random() < 0.45:
+        if draw == 'combo' and st == 'flop' and _can_raise(c) and random.random() < 0.50:
             return _act({"action": "raise", "amount": _raise_over(c, SIZE_BIG)}, "semi-bluff raise")
         return _act({"action": "fold"}, "marginal fold")
-    if not _can_raise(c):
-        return _act({"action": "check"}, "marginal check")
-    if draw and st != 'river':
-        frac = SIZE_BIG
-        p = 0.70 if draw == 'combo' else (0.50 if sd else 0.25)
-        if not (c['initiative'] or c['is_dealer']):
-            p *= 0.5
-        if om.is_calling_station:
-            p *= 0.4
-        if random.random() < p:
-            return _bet(c, frac, f"semi-bluff {draw}")
-        return _act({"action": "check"}, "draw check")
-    # small stab in position when they showed weakness (checked to us)
-    if c['is_dealer'] and c['opp_checked'] and _bluff_ok(c, SIZE_SMALL) and random.random() < 0.35:
-        return _bet(c, SIZE_SMALL, "position stab (thin value/protection)")
+    if draw and st != 'river' and _can_raise(c):
+        if not (we_raised_preflop or c['is_dealer']):
+            return _act({"action": "check"}, "draw, no c-bet rights")
+        if draw == 'combo' and random.random() < 0.65:
+            return _act({"action": "raise", "amount": _open_bet(c, SIZE_BIG)}, "semi-bluff combo")
+        if sd and random.random() < 0.45:
+            return _act({"action": "raise", "amount": _open_bet(c, SIZE_BIG)}, "semi-bluff draw")
     return _act({"action": "check"}, "marginal check")
 
 
@@ -771,33 +646,30 @@ def _play_weak(c):
         return _act({"action": "fold"}, "weak fold")
     if not _can_raise(c):
         return _act({"action": "check"}, "weak check")
-    frac = SIZE_BIG if bi.get('wet') else SIZE_SMALL
-    if not _bluff_ok(c, frac):
+    if not we_raised_preflop:
+        return _act({"action": "check"}, "no c-bet rights")
+    if bi.get('caller_favored'):
+        return _act({"action": "check"}, "caller's board, no bluff")
+    wet = bi.get('wet')
+    fr = om.get_fold_to_bet(st)
+    bluff_frac = SIZE_BIG if wet else SIZE_SMALL
+    be_threshold = bluff_frac / (1 + bluff_frac)     # break-even fold frequency
+    if fr < be_threshold + 0.05:
         return _act({"action": "check"}, "bluff -EV")
-    if c['initiative']:
-        # continuation bet / barrel: we told a strong story preflop
-        freq = 0.55 if not bi.get('wet') else 0.35
-        if bi.get('caller_favored'):
-            freq -= 0.20
-        if st == 'turn':
-            freq = 0.40 if bi.get('raiser_favored') else 0.25
-        elif st == 'river':
-            freq = 0.25
-        if om.is_overfolder:
-            freq += 0.25
-        if random.random() < freq:
-            return _bet(c, frac, f"{st} bluff (story)")
-    elif c['is_dealer'] and c['opp_checked']:
-        # they checked twice-ish: float/stab in position
-        if random.random() < (0.45 if om.is_overfolder else 0.25):
-            return _bet(c, SIZE_SMALL, "position stab bluff")
-    return _act({"action": "check"}, "give up")
+    freq = 0.25 if wet else 0.40
+    if st == 'turn' and bi.get('raiser_favored'):
+        freq += 0.10
+    elif st == 'river':
+        freq -= 0.10
+    if random.random() < freq:
+        return _act({"action": "raise", "amount": _open_bet(c, bluff_frac)}, "c-bet bluff")
+    return _act({"action": "check"}, "bluff randomized out")
 
 
 def postflop_decision(my_cards, community, street, pot, owed, can_check, can_raise,
-                      min_r, max_r, stack, opp_stack, seven_two, om, is_dealer, cur_bet,
-                      opp_frac, initiative, opp_checked, time_cap):
-    equity = calc_equity(my_cards, community, 2500, opp_frac=opp_frac, max_seconds=time_cap)
+                      min_r, max_r, stack, opp_stack, seven_two, om, is_dealer, cur_bet):
+    opp_vpip = om.vpip if (owed > 0 and om.hands_seen >= 10) else None
+    equity = calc_equity(my_cards, community, 1500, opp_vpip=opp_vpip)
     equity = shade_equity(equity, owed, pot, stack, om)
     bi = analyze_board(community)
     wet = bi['wet']
@@ -805,19 +677,17 @@ def postflop_decision(my_cards, community, street, pot, owed, can_check, can_rai
     spr = min(stack, opp_stack) / max(pot, 1)
     po = owed / (pot + owed) if owed > 0 else 0.0
 
-    dbg(f"  [{street}] eq={equity:.0%} range={opp_frac:.0%} wet={wet} draw={draw} "
-        f"owed={owed} pot={pot} init={initiative}")
+    dbg(f"  [{street}] eq={equity:.0%} wet={wet} draw={draw} owed={owed} pot={pot}")
 
     c = {'pot': pot, 'owed': owed, 'cc': can_check, 'cr': can_raise, 'mn': min_r,
          'mx': max_r, 'cur': cur_bet, 'street': street, 'bi': bi, 'om': om,
-         'is_dealer': is_dealer, 'eq': equity, 'draw': draw, 'spr': spr, 'po': po,
-         'initiative': initiative, 'opp_checked': opp_checked}
+         'is_dealer': is_dealer, 'eq': equity, 'draw': draw, 'spr': spr, 'po': po}
 
-    # 7-2 bounty: barrel when nobody has bet; fold to resistance via normal logic
+    # 7-2: barrel when nobody has bet; fold to resistance via normal logic
     if seven_two and owed == 0 and can_raise and max_r > 0 and equity < 0.55 \
             and not om.is_calling_station:
-        if (initiative or random.random() < 0.5) and random.random() < 0.85:
-            return _bet(c, 0.75, "7-2 barrel")
+        if (we_raised_preflop or random.random() < 0.5) and random.random() < 0.85:
+            return _act({"action": "raise", "amount": _open_bet(c, 0.75)}, "7-2 barrel")
 
     bump = 0.03 if wet else 0.0
     if equity > 0.85 + bump:
@@ -829,41 +699,6 @@ def postflop_decision(my_cards, community, street, pot, owed, can_check, can_rai
     if equity > 0.40 or draw:
         return _play_marginal(c)
     return _play_weak(c)
-
-
-# =====================================================================
-# RANGE READING: how wide is the opponent's range, given what they did?
-# =====================================================================
-def estimate_opp_range(action_log, my_seat, om, is_dealer):
-    pf = [e for e in action_log if e.get('street') == 'preflop'
-          and e.get('action') not in ('small_blind', 'big_blind', 'ante')]
-    opp_raises = sum(1 for e in pf if e.get('seat') != my_seat
-                     and e.get('action') in ('raise', 'all_in'))
-    opp_called = any(e.get('seat') != my_seat and e.get('action') == 'call' for e in pf)
-    if opp_raises >= 2:
-        frac = max(0.06, om.threebet * 0.6)
-    elif opp_raises == 1:
-        my_raised_first = False
-        for e in pf:
-            if e.get('action') in ('raise', 'all_in'):
-                my_raised_first = (e.get('seat') == my_seat)
-                break
-        if my_raised_first:          # they 3-bet us
-            frac = max(0.08, om.threebet)
-        else:                        # they opened
-            frac = max(0.20, min(1.0, om.pfr * 1.05))
-    elif opp_called:
-        frac = max(0.30, min(1.0, om.vpip))
-    else:
-        frac = 1.0                   # BB checked option: any two cards
-    # postflop: every bet/raise they make narrows them further
-    for e in action_log:
-        if e.get('street') != 'preflop' and e.get('seat') != my_seat:
-            if e.get('action') in ('raise', 'all_in'):
-                frac *= 0.80 if not om.is_aggressive else 0.92
-            elif e.get('action') == 'call':
-                frac *= 0.90
-    return max(0.05, min(1.0, frac))
 
 
 # =====================================================================
@@ -892,8 +727,6 @@ def _decide_inner(gs):
     my_bet_st = gs.get("your_bet_this_street", 0)
     bb = max(gs.get("blinds", {}).get("bb", 100), 1)
     hand_num = gs.get("hand_num", 0)
-    tl = gs.get("time_limit_ms", 2000) or 2000
-    time_cap = max(0.15, min(0.7, tl / 1000.0 * 0.35))
 
     opp_stack = stack
     for pl in gs.get("players", []):
@@ -904,10 +737,8 @@ def _decide_inner(gs):
     can_raise = min_r > 0 and stack > owed
     max_r = stack + my_bet_st if can_raise else 0
     is_dealer = (my_seat == button)
-    stack_bb = min(stack + my_bet_st, opp_stack) / bb
+    stack_bb = min(stack, opp_stack) / bb
     cur_bet = my_bet_st + owed
-    shove = {"action": "raise", "amount": max_r} if can_raise else \
-        ({"action": "call"} if owed > 0 else {"action": "check"})
 
     we_raised_preflop = any(
         e.get('seat') == my_seat and e.get('street') == 'preflop'
@@ -916,59 +747,32 @@ def _decide_inner(gs):
     opp_model.update(match_log, my_seat, hand_num)
 
     tier = get_tier(my_cards)
-    canon = canonicalize(my_cards)
     seven_two = _is_seven_two(my_cards)
 
     if street == 'preflop':
         if stack_bb <= 12:
             r = push_fold_decision(tier, is_dealer, stack_bb, stack, can_raise, can_check,
-                                   owed, seven_two, my_cards, opp_model, shove)
+                                   owed, seven_two, my_cards, opp_model)
             if r is not None:
                 return r
-        return preflop_decision(tier, canon, is_dealer, seven_two, pot, owed, can_check,
-                                can_raise, min_r, max_r, stack, bb, action_log, opp_model,
-                                cur_bet)
-
-    # Initiative = we were the last aggressor on the previous street(s)
-    last_aggr = None
-    for e in action_log:
-        if e.get('street') != street and e.get('action') in ('raise', 'all_in'):
-            last_aggr = e.get('seat')
-    initiative = (last_aggr == my_seat)
-    opp_checked = any(e.get('street') == street and e.get('seat') != my_seat
-                      and e.get('action') == 'check' for e in action_log)
-    opp_frac = estimate_opp_range(action_log, my_seat, opp_model, is_dealer)
+        return preflop_decision(tier, is_dealer, seven_two, pot, owed, can_check, can_raise,
+                                min_r, max_r, stack, bb, action_log, opp_model, cur_bet)
 
     return postflop_decision(my_cards, community, street, pot, owed, can_check, can_raise,
                              min_r, max_r, stack, opp_stack, seven_two, opp_model,
-                             is_dealer, cur_bet, opp_frac, initiative, opp_checked, time_cap)
-
-
-def _safe_fallback(game_state):
-    if game_state.get("type") == "warmup":
-        return {"action": "check"}
-    if game_state.get("can_check"):
-        return {"action": "check"}
-    owed = game_state.get("amount_owed", 0)
-    if 0 < owed <= game_state.get("pot", 1) * 0.2:
-        return {"action": "call"}
-    return {"action": "fold"}
+                             is_dealer, cur_bet)
 
 
 def decide(game_state: dict) -> dict:
     try:
-        a = _decide_inner(game_state)
-        # final sanity check so we never send an illegal action
-        if a.get("action") == "raise":
-            amt = int(a.get("amount", 0))
-            mn = game_state.get("min_raise_to", 0)
-            mx = game_state.get("your_stack", 0) + game_state.get("your_bet_this_street", 0)
-            if mn <= 0 or mx <= 0:
-                return {"action": "call"} if game_state.get("amount_owed", 0) > 0 else {"action": "check"}
-            a = {"action": "raise", "amount": max(min(amt, mx), min(mn, mx))}
-        if a.get("action") == "check" and not game_state.get("can_check", False):
-            return {"action": "fold"}
-        return a
+        return _decide_inner(game_state)
     except Exception as e:
         dbg(f"  !!! ERROR: {e}")
-        return _safe_fallback(game_state)
+        if game_state.get("type") == "warmup":
+            return {"action": "check"}
+        if game_state.get("can_check"):
+            return {"action": "check"}
+        owed = game_state.get("amount_owed", 0)
+        if 0 < owed <= game_state.get("pot", 1) * 0.2:
+            return {"action": "call"}
+        return {"action": "fold"}
