@@ -11,9 +11,6 @@ def dbg(msg=""):
         print(msg)
 
 
-# =====================================================================
-# CONSTANTS
-# =====================================================================
 RANK_ORDER = "23456789TJQKA"
 RANK_VAL = {r: i for i, r in enumerate(RANK_ORDER)}
 SIZE_SMALL = 0.40   # dry boards
@@ -78,10 +75,6 @@ PUSH_CALL = {
     'KQo': 45, 'KJo': 15, 'KTo': 14, 'K9o': 11, 'K8o': 8,
     'QJo': 13, 'QTo': 10, 'Q9o': 8, 'JTo': 13, 'J9o': 5, 'T9o': 6}
 
-
-# =====================================================================
-# HELPERS
-# =====================================================================
 def _norm_rank(r):
     return 'T' if r == '10' else r
 
@@ -203,10 +196,6 @@ def analyze_board(community):
             'connected': connected, 'high': high, 'raiser_favored': raiser_fav,
             'caller_favored': caller_fav, 'highest_rank': sr[-1]}
 
-
-# =====================================================================
-# EQUITY (Monte Carlo, time-capped so we never hit the 2 s limit)
-# =====================================================================
 def calc_equity(my_cards, community, n_sim=1500, opp_vpip=None, max_seconds=0.6):
     my_hand = [card_str_to_eval7(c) for c in my_cards]
     board = [card_str_to_eval7(c) for c in community]
@@ -263,10 +252,6 @@ def shade_equity(eq, owed, pot, stack, om):
         f = 1 - (1 - f) * 0.4      # maniacs bet wide: trust equity more
     return eq * f
 
-
-# =====================================================================
-# OPPONENT MODEL
-# =====================================================================
 class OpponentModel:
     def __init__(self):
         self.reset()
